@@ -1,0 +1,243 @@
+---
+- include: "common.yml"
+  tags: always
+
+- name: "terminate cluster"
+  hosts: all:!pods
+  gather_facts: False
+  tags: instance
+
+  tasks:
+    - name: "terminate cluster"
+      delegate_to: localhost
+      run_once: true
+      block:
+        - name: "terminate instances"
+          ec2_instance:
+            state: absent
+            filters:
+              "tag:Name": "{{ cluster }}-*"
+            wait: True
+
+        - name: "list AMIs"
+          ec2_ami_find:
+            owner: self
+            name: "{{ cluster }}_autoscale_image*"
+            region: "{{ aws_region }}"
+            profile: "{{ profile }}"
+          register: tmp
+
+        - name: "delete images"
+          ec2_ami:
+            image_id: "{{ item }}"
+            region: "{{ aws_region }}"
+            profile: "{{ profile }}"
+            delete_snapshot: yes
+            wait: no
+            state: absent
+          with_items: "{{ tmp.results | map(attribute='ami_id') | list }}"
+
+        - name: "get all DNS hosted zones"
+          tags: dns
+          route53_facts:
+            profile: "{{ aws_route53_public_profile }}"
+            query: hosted_zone
+          register: tmp
+          when: not disabled_dns|default(False)|bool
+
+        - name: "find our DNS hosted zone id"
+          tags: dns
+          set_fact:
+            hosted_zone_id: "{{ item.Id }}"
+          with_items: "{{ tmp.HostedZones|default([]) }}"
+          when: item.Name == aws_route53_zone + '.'
+
+        # This should be done by repeating an include...
+        - name: "get DNS records section 1"
+          tags: dns
+          route53_facts:
+            profile: "{{ aws_route53_public_profile }}"
+            query: record_sets
+            hosted_zone_id: "{{ hosted_zone_id }}"
+          register: tmp
+          when: hosted_zone_id is defined
+
+        - name: "remove cluster DNS record section 1"
+          tags: dns
+          route53:
+            profile: "{{ aws_route53_public_profile }}"
+            zone: "{{ aws_route53_zone }}"
+            private_zone: false
+            record: "{{ item.Name }}"
+            type: "{{ item.Type }}"
+            value: "{{ item.ResourceRecords|map(attribute='Value')|join(',') }}"
+            ttl: "{{ item.TTL }}"
+            command: delete
+          # items with 'AliasTarget' in them are created by k8s external-dns on ingress, and need to be managed by that
+          when: item.Type == 'A' or item.Type == 'CNAME' and 'AliasTarget' not in item
+          with_items: "{{ tmp.ResourceRecordSets|default([]) }}"
+
+        - name: "get DNS records section 2"
+          tags: dns
+          route53_facts:
+            profile: "{{ aws_route53_public_profile }}"
+            query: record_sets
+            hosted_zone_id: "{{ hosted_zone_id }}"
+            start_record_name: "{{ tmp.NextRecordName }}"
+          when: "'NextRecordName' in tmp"
+          register: tmp
+
+        - name: "remove cluster DNS records section 2"
+          tags: dns
+          route53:
+            profile: "{{ aws_route53_public_profile }}"
+            zone: "{{ aws_route53_zone }}"
+            private_zone: false
+            record: "{{ item.Name }}"
+            type: "{{ item.Type }}"
+            value: "{{ item.ResourceRecords|map(attribute='Value')|join(',') }}"
+            ttl: "{{ item.TTL }}"
+            command: delete
+          # items with 'AliasTarget' in them are created by k8s external-dns on ingress, and need to be managed by that
+          when: item.Type == 'A' or item.Type == 'CNAME' and 'AliasTarget' not in item
+          with_items: "{{ tmp.ResourceRecordSets|default([]) }}"
+
+        - name: "remove our hosted zone"
+          tags: dns,dnszone
+          route53_zone:
+            profile: "{{ aws_route53_public_profile }}"
+            zone: "{{ aws_route53_zone }}"
+            state: absent
+          when: hosted_zone_id is defined and not skip_zone_creation|default(False)|bool
+
+        - name: "remove our efs volume"
+          efs:
+            name: "{{ aws_prefix }}-{{ cluster }}"
+            state: absent
+
+        - name: "load hive db variables"
+          include_vars: "roles/hive/vars/hive-internal.yml"
+
+        - name: "load oozie db variables"
+          include_vars: "roles/oozie/vars/oozie.yml"
+
+        - name: "load hue db variables"
+          include_vars: "roles/hue/vars/hue.yml"
+
+        - name: "load airflow db variables"
+          include_vars: "roles/airflow/vars/airflow.yml"
+
+        # always load users.yml and rds-common.yml together because
+        # "rds_password" in rds-common.yml references "encoded_egsadmin_password" in users.yml
+        - name: "load variables in users.yml and rds-common.yml"
+          include_vars: "{{ item }}"
+          with_items:
+            - "users.yml"
+            - "rds-common.yml"
+            - "rds-{{ profile }}.yml"
+
+        - name: "remove mysql dbs's from rds"
+          mysql_db:
+            login_host: "{{ rds_hostname }}"
+            login_user: "{{ rds_user }}"
+            login_password: "{{ rds_password }}"
+            name: "{{ item }}"
+            state: absent
+          with_items:
+            - "{{ hive_metastore_db }}"
+            - "{{ oozie_db }}"
+            - "{{ hue_db }}"
+            - "{{ airflow_db }}"
+          when: cluster not in ["dev1", "qa2", "prd1"]
+
+        - name: "find security group id"
+          tags: security_group
+          ec2_group_facts:
+            filters:
+              group-name: "{{ aws_prefix }}-{{ cluster }}-sg"
+          check_mode: no
+          register: security_groups
+
+        - name: "sanity check to make sure we only match one security group"
+          tags: security_group
+          fail:
+            msg: "Expected no more than one security group, got: {{ security_groups.security_groups }}"
+          when: security_groups.security_groups|length > 1
+
+        - name: "remove security group related items, if security group is present"
+          tags: security_group
+          block:
+            - name: "set ec2_group_id"
+              set_fact:
+                ec2_group_id: "{{ security_groups.security_groups[0].group_id }}"
+              run_once: true
+
+            # always load users.yml and rds-common.yml together because
+            # "rds_password" in rds-common.yml references "encoded_egsadmin_password" in users.yml
+            - name: "load variables in users.yml and rds-common.yml"
+              include_vars: "{{ item }}"
+              with_items:
+                - "users.yml"
+                - "rds-common.yml"
+                - "rds-{{ profile }}.yml"
+
+            - name: "fetch rds information"
+              rds:
+                command: facts
+                instance_name: "{{ rds_db_name }}"
+                region: "{{ aws_region }}"
+              check_mode: no
+              register: tmp
+
+            - name: "remove group from rds security group ingress"
+              rds:
+                command: modify
+                instance_name: "{{ rds_db_name }}"
+                vpc_security_groups: "{{ tmp.instance.vpc_security_groups.split(',') | difference([ec2_group_id]) | join(',') }}"
+                region: "{{ aws_region }}"
+              when: ec2_group_id in tmp.instance.vpc_security_groups.split(',')
+              register: remove
+
+            - name: "wait for security group to be removed from the rds instance and the instance to be available"
+              rds:
+                command: facts
+                instance_name: "{{ rds_db_name }}"
+                region: "{{ aws_region }}"
+              check_mode: no
+              register: tmp
+              retries: 20
+              until: tmp|success and tmp.instance.status == "available" and ec2_group_id not in tmp.instance.vpc_security_groups.split(',')
+              delay: "{{ 20 + (40 | random) }}"
+              when: remove|changed
+
+            - name: "wait until rds instance is available"
+              rds:
+                command: facts
+                instance_name: "{{ rds_db_name }}"
+                region: "{{ aws_region }}"
+              check_mode: no
+              register: tmp
+              retries: 20
+              until: tmp|success and tmp.instance.status == "available"
+              delay: "{{ 20 + (40 | random) }}"
+
+            - name: "remove security group"
+              ec2_group:
+                name: "{{ security_groups.security_groups[0].group_name }}"
+                state: absent
+                region: "{{ aws_region }}"
+          when: security_groups.security_groups|length == 1
+
+        - name: "remove dashboards"
+          tags: dashboards
+          block:
+            - name: "get cluster dashboards"
+              cloudwatch_dashboard_info:
+                prefix: "{{ aws_prefix }}-{{ cluster }}-"
+              register: dashes
+
+            - name: "remove cluster dashboards"
+              cloudwatch_dashboard:
+                name: "{{ item.key }}"
+                state: absent
+              with_dict: "{{ dashes.dashboards }}"
